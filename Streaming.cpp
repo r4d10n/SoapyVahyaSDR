@@ -5,6 +5,10 @@
 #include <cstring>
 #include <algorithm>
 
+// Track overflow/underflow for edge-triggered logging (log once on transition)
+static bool _overflowReported[2] = {};
+static bool _underflowReported[2] = {};
+
 // ==== libvahya RX callbacks (called from libusb event thread) ====
 
 void SoapyVahyaSDR::rxCallback900(const int16_t *iq_data, size_t num_samples, void *ctx)
@@ -170,9 +174,11 @@ int SoapyVahyaSDR::activateStream(SoapySDR::Stream *stream, const int /*flags*/,
     auto *vs = reinterpret_cast<VahyaStream *>(stream);
     if (!vs || vs->active) return 0;
 
-    // Reset ring buffers before starting
+    // Reset ring buffers and log flags before starting
     for (auto ch : vs->channels) {
         vs->ringbufs[ch].reset();
+        _overflowReported[ch] = false;
+        _underflowReported[ch] = false;
     }
 
     vs->active = true;
@@ -337,10 +343,13 @@ int SoapyVahyaSDR::readStream(SoapySDR::Stream *stream, void *const *buffs,
         }
     }
 
-    // Report overflow if detected
+    // Report overflow if detected (log only on first occurrence per activation)
     for (auto ch : vs->channels) {
         if (vs->ringbufs[ch].overflow.exchange(false)) {
-            SoapySDR::logf(SOAPY_SDR_WARNING, "SoapyVahyaSDR: RX ch%zu ring buffer overflow", ch);
+            if (!_overflowReported[ch]) {
+                SoapySDR::logf(SOAPY_SDR_WARNING, "SoapyVahyaSDR: RX ch%zu ring buffer overflow", ch);
+                _overflowReported[ch] = true;
+            }
             return SOAPY_SDR_OVERFLOW;
         }
     }
@@ -400,10 +409,13 @@ int SoapyVahyaSDR::writeStream(SoapySDR::Stream *stream, const void *const *buff
         }
     }
 
-    // Report underflow if detected on any channel
+    // Report underflow if detected on any channel (log only on first occurrence per activation)
     for (auto ch : vs->channels) {
         if (vs->ringbufs[ch].underflow.exchange(false)) {
-            SoapySDR::logf(SOAPY_SDR_WARNING, "SoapyVahyaSDR: TX ch%zu ring buffer underflow", ch);
+            if (!_underflowReported[ch]) {
+                SoapySDR::logf(SOAPY_SDR_WARNING, "SoapyVahyaSDR: TX ch%zu ring buffer underflow", ch);
+                _underflowReported[ch] = true;
+            }
         }
     }
 
