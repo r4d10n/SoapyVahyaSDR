@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
+#include <unistd.h>
 
 SoapyVahyaSDR::SoapyVahyaSDR(const SoapySDR::Kwargs &/*args*/)
     : _dev(nullptr), _rxStream(nullptr), _txStream(nullptr)
@@ -25,20 +26,43 @@ SoapyVahyaSDR::SoapyVahyaSDR(const SoapySDR::Kwargs &/*args*/)
                                  "(VID=0x1209 PID=0x0001)");
     }
 
-    // Verify AT86RF215IQ is present via SPI
-    uint8_t partNum = 0, version = 0;
-    if (vahya_spi_read(_dev, AT86_RF_PN, &partNum) != 0 ||
-        vahya_spi_read(_dev, AT86_RF_VN, &version) != 0) {
-        vahya_close(_dev);
-        _dev = nullptr;
-        throw std::runtime_error("SoapyVahyaSDR: SPI communication failed");
-    }
+    // Reset AT86RF215 to ensure clean state after previous session
+    vahya_reset_at86(_dev);
+    usleep(50000);  // 50 ms for AT86 startup + CLKO stabilization
 
-    if (partNum != 0x35) {
+    // Verify AT86RF215IQ is present via SPI, retry once after reset
+    uint8_t partNum = 0, version = 0;
+    int spi_ok = (vahya_spi_read(_dev, AT86_RF_PN, &partNum) == 0 &&
+                  vahya_spi_read(_dev, AT86_RF_VN, &version) == 0 &&
+                  partNum == 0x35);
+
+    if (!spi_ok) {
+        // Retry: close, reopen with fresh USB context (clears stale state)
+        SoapySDR::logf(SOAPY_SDR_WARNING,
+            "SoapyVahyaSDR: first SPI attempt failed (part=0x%02x), retrying...", partNum);
         vahya_close(_dev);
-        _dev = nullptr;
-        throw std::runtime_error("SoapyVahyaSDR: unexpected part number 0x" +
-                                 std::to_string(partNum) + " (expected 0x35 for IQ variant)");
+        usleep(500000);  // 500 ms
+        _dev = vahya_open();
+        if (!_dev) {
+            throw std::runtime_error("SoapyVahyaSDR: failed to reopen device after retry");
+        }
+        vahya_reset_at86(_dev);
+        usleep(50000);
+
+        partNum = 0; version = 0;
+        if (vahya_spi_read(_dev, AT86_RF_PN, &partNum) != 0 ||
+            vahya_spi_read(_dev, AT86_RF_VN, &version) != 0) {
+            vahya_close(_dev);
+            _dev = nullptr;
+            throw std::runtime_error("SoapyVahyaSDR: SPI communication failed after retry");
+        }
+
+        if (partNum != 0x35) {
+            vahya_close(_dev);
+            _dev = nullptr;
+            throw std::runtime_error("SoapyVahyaSDR: unexpected part number 0x" +
+                                     std::to_string(partNum) + " (expected 0x35)");
+        }
     }
 
     SoapySDR::logf(SOAPY_SDR_INFO,
